@@ -673,6 +673,66 @@ var _ = Describe("LaunchTemplate Provider", func() {
 				}))
 			})
 		})
+		It("should use kms key id based on kms alias", func() {
+			nodeClass.Spec.BlockDeviceMappings = []*v1.BlockDeviceMapping{
+				{
+					DeviceName: aws.String("/dev/xvda"),
+					EBS: &v1.BlockDevice{
+						DeleteOnTermination: aws.Bool(true),
+						Encrypted:           aws.Bool(true),
+						VolumeType:          aws.String("io2"),
+						VolumeSize:          lo.ToPtr(resource.MustParse("200G")),
+						IOPS:                aws.Int64(10_000),
+						KMSKeyID:            aws.String("arn:aws:kms:us-east-2:111122223333:alias/mykmskey"),
+					},
+				},
+			}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+			pod := coretest.UnschedulablePod()
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+			Expect(awsEnv.EC2API.CalledWithCreateLaunchTemplateInput.Len()).To(BeNumerically("==", 5))
+			awsEnv.EC2API.CalledWithCreateLaunchTemplateInput.ForEach(func(ltInput *ec2.CreateLaunchTemplateInput) {
+				Expect(ltInput.LaunchTemplateData.BlockDeviceMappings[0].Ebs).To(Equal(&ec2.LaunchTemplateEbsBlockDeviceRequest{
+					VolumeSize:          aws.Int64(187),
+					VolumeType:          aws.String("io2"),
+					Iops:                aws.Int64(10_000),
+					DeleteOnTermination: aws.Bool(true),
+					Encrypted:           aws.Bool(true),
+					KmsKeyId:            aws.String("arn:aws:kms:us-east-2:111122223333:key/1234abcd-12ab-34cd-56ef-2345678901ab"),
+				}))
+			})
+		})
+		It("should not replace key if alias is not found", func() {
+			nodeClass.Spec.BlockDeviceMappings = []*v1.BlockDeviceMapping{
+				{
+					DeviceName: aws.String("/dev/xvda"),
+					EBS: &v1.BlockDevice{
+						DeleteOnTermination: aws.Bool(true),
+						Encrypted:           aws.Bool(true),
+						VolumeType:          aws.String("io2"),
+						VolumeSize:          lo.ToPtr(resource.MustParse("200G")),
+						IOPS:                aws.Int64(10_000),
+						KMSKeyID:            aws.String("arn:aws:kms:us-east-2:111122223333:alias/nonexisting"),
+					},
+				},
+			}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+			pod := coretest.UnschedulablePod()
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+			Expect(awsEnv.EC2API.CalledWithCreateLaunchTemplateInput.Len()).To(BeNumerically("==", 5))
+			awsEnv.EC2API.CalledWithCreateLaunchTemplateInput.ForEach(func(ltInput *ec2.CreateLaunchTemplateInput) {
+				Expect(ltInput.LaunchTemplateData.BlockDeviceMappings[0].Ebs).To(Equal(&ec2.LaunchTemplateEbsBlockDeviceRequest{
+					VolumeSize:          aws.Int64(187),
+					VolumeType:          aws.String("io2"),
+					Iops:                aws.Int64(10_000),
+					DeleteOnTermination: aws.Bool(true),
+					Encrypted:           aws.Bool(true),
+					KmsKeyId:            aws.String("arn:aws:kms:us-east-2:111122223333:alias/nonexisting"),
+				}))
+			})
+		})
 		It("should round up for custom block device mappings when specified in gigabytes", func() {
 			nodeClass.Spec.BlockDeviceMappings = []*v1.BlockDeviceMapping{
 				{

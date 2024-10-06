@@ -37,6 +37,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/aws/aws-sdk-go/service/eks/eksiface"
+	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	prometheusv1 "github.com/jonathan-innis/aws-sdk-go-prometheus/v1"
 	"github.com/patrickmn/go-cache"
@@ -161,6 +162,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval),
 		ec2api,
 		eks.New(sess),
+		kms.New(sess),
 		amiResolver,
 		securityGroupProvider,
 		subnetProvider,

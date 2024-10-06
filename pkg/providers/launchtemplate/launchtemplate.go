@@ -16,6 +16,7 @@ package launchtemplate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -32,6 +33,8 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/aws/aws-sdk-go/service/eks/eksiface"
+	"github.com/aws/aws-sdk-go/service/kms"
+	"github.com/aws/aws-sdk-go/service/kms/kmsiface"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
@@ -70,6 +73,7 @@ type DefaultProvider struct {
 	sync.Mutex
 	ec2api                ec2iface.EC2API
 	eksapi                eksiface.EKSAPI
+	kmsapi                kmsiface.KMSAPI
 	amiFamily             amifamily.Resolver
 	securityGroupProvider securitygroup.Provider
 	subnetProvider        subnet.Provider
@@ -81,12 +85,13 @@ type DefaultProvider struct {
 	ClusterCIDR           atomic.Pointer[string]
 }
 
-func NewDefaultProvider(ctx context.Context, cache *cache.Cache, ec2api ec2iface.EC2API, eksapi eksiface.EKSAPI, amiFamily amifamily.Resolver,
+func NewDefaultProvider(ctx context.Context, cache *cache.Cache, ec2api ec2iface.EC2API, eksapi eksiface.EKSAPI, kmsapi kmsiface.KMSAPI, amiFamily amifamily.Resolver,
 	securityGroupProvider securitygroup.Provider, subnetProvider subnet.Provider,
 	caBundle *string, startAsync <-chan struct{}, kubeDNSIP net.IP, clusterEndpoint string) *DefaultProvider {
 	l := &DefaultProvider{
 		ec2api:                ec2api,
 		eksapi:                eksapi,
+		kmsapi:                kmsapi,
 		amiFamily:             amiFamily,
 		securityGroupProvider: securityGroupProvider,
 		subnetProvider:        subnetProvider,
@@ -115,11 +120,11 @@ func (p *DefaultProvider) EnsureAll(ctx context.Context, nodeClass *v1.EC2NodeCl
 	p.Lock()
 	defer p.Unlock()
 
-	options, err := p.createAMIOptions(ctx, nodeClass, lo.Assign(nodeClaim.Labels, map[string]string{karpv1.CapacityTypeLabelKey: capacityType}), tags)
+	amiOptions, err := p.createAMIOptions(ctx, nodeClass, lo.Assign(nodeClaim.Labels, map[string]string{karpv1.CapacityTypeLabelKey: capacityType}), tags)
 	if err != nil {
 		return nil, err
 	}
-	resolvedLaunchTemplates, err := p.amiFamily.Resolve(nodeClass, nodeClaim, instanceTypes, capacityType, options)
+	resolvedLaunchTemplates, err := p.amiFamily.Resolve(nodeClass, nodeClaim, instanceTypes, capacityType, amiOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +239,7 @@ func (p *DefaultProvider) createLaunchTemplate(ctx context.Context, options *ami
 	output, err := p.ec2api.CreateLaunchTemplateWithContext(ctx, &ec2.CreateLaunchTemplateInput{
 		LaunchTemplateName: aws.String(LaunchTemplateName(options)),
 		LaunchTemplateData: &ec2.RequestLaunchTemplateData{
-			BlockDeviceMappings: p.blockDeviceMappings(options.BlockDeviceMappings),
+			BlockDeviceMappings: p.blockDeviceMappings(options.BlockDeviceMappings, ctx),
 			IamInstanceProfile: &ec2.LaunchTemplateIamInstanceProfileSpecificationRequest{
 				Name: aws.String(options.InstanceProfile),
 			},
@@ -303,13 +308,24 @@ func (p *DefaultProvider) generateNetworkInterfaces(options *amifamily.LaunchTem
 	return nil
 }
 
-func (p *DefaultProvider) blockDeviceMappings(blockDeviceMappings []*v1.BlockDeviceMapping) []*ec2.LaunchTemplateBlockDeviceMappingRequest {
+func (p *DefaultProvider) blockDeviceMappings(blockDeviceMappings []*v1.BlockDeviceMapping, ctx context.Context) []*ec2.LaunchTemplateBlockDeviceMappingRequest {
 	if len(blockDeviceMappings) == 0 {
 		// The EC2 API fails with empty slices and expects nil.
 		return nil
 	}
 	var blockDeviceMappingsRequest []*ec2.LaunchTemplateBlockDeviceMappingRequest
 	for _, blockDeviceMapping := range blockDeviceMappings {
+		kmsKey := blockDeviceMapping.EBS.KMSKeyID
+		if blockDeviceMapping.EBS.KMSKeyID != nil &&
+			strings.Contains(*blockDeviceMapping.EBS.KMSKeyID, "alias") {
+			keyArn, err := findKeyArnByAlias(p, blockDeviceMapping.EBS.KMSKeyID)
+			if err != nil {
+				log.FromContext(ctx).Error(err, "unable to find kms key by alias")
+			}
+			if keyArn != nil {
+				kmsKey = keyArn
+			}
+		}
 		blockDeviceMappingsRequest = append(blockDeviceMappingsRequest, &ec2.LaunchTemplateBlockDeviceMappingRequest{
 			DeviceName: blockDeviceMapping.DeviceName,
 			Ebs: &ec2.LaunchTemplateEbsBlockDeviceRequest{
@@ -318,13 +334,35 @@ func (p *DefaultProvider) blockDeviceMappings(blockDeviceMappings []*v1.BlockDev
 				VolumeType:          blockDeviceMapping.EBS.VolumeType,
 				Iops:                blockDeviceMapping.EBS.IOPS,
 				Throughput:          blockDeviceMapping.EBS.Throughput,
-				KmsKeyId:            blockDeviceMapping.EBS.KMSKeyID,
+				KmsKeyId:            kmsKey,
 				SnapshotId:          blockDeviceMapping.EBS.SnapshotID,
 				VolumeSize:          p.volumeSize(blockDeviceMapping.EBS.VolumeSize),
 			},
 		})
 	}
 	return blockDeviceMappingsRequest
+}
+
+func findKeyArnByAlias(p *DefaultProvider, kmsAlias *string) (*string, error) {
+	/* TODO
+	1) create clusters
+	2) deploy karpenter
+	3) create kms key
+	4) create alias to key
+	5) test EC2NodeClass by referencing alias, not key
+	6) if good, use DescribeKey using alias. Not ListAliases.
+	*/
+	key, err := p.kmsapi.DescribeKey(&kms.DescribeKeyInput{
+		KeyId: kmsAlias,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if key != nil && key.KeyMetadata != nil {
+		return key.KeyMetadata.Arn, nil
+	}
+
+	return nil, errors.New("unable to find kms key by alias")
 }
 
 // volumeSize returns a GiB scaled value from a resource quantity or nil if the resource quantity passed in is nil

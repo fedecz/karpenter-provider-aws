@@ -57,6 +57,7 @@ type Environment struct {
 	EKSAPI     *fake.EKSAPI
 	SSMAPI     *fake.SSMAPI
 	IAMAPI     *fake.IAMAPI
+	KMSAPI     *fake.KMSAPI
 	PricingAPI *fake.PricingAPI
 
 	// Cache
@@ -88,13 +89,14 @@ type Environment struct {
 
 func NewEnvironment(ctx context.Context, env *coretest.Environment) *Environment {
 	// Mock
-	clock := &clock.FakeClock{}
+	fakeClock := &clock.FakeClock{}
 
 	// API
 	ec2api := fake.NewEC2API()
 	eksapi := fake.NewEKSAPI()
 	ssmapi := fake.NewSSMAPI()
 	iamapi := fake.NewIAMAPI()
+	kmsapi := fake.NewKMSAPI()
 
 	// cache
 	ec2Cache := cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval)
@@ -117,7 +119,7 @@ func NewEnvironment(ctx context.Context, env *coretest.Environment) *Environment
 	versionProvider := version.NewDefaultProvider(env.KubernetesInterface, kubernetesVersionCache)
 	instanceProfileProvider := instanceprofile.NewDefaultProvider(fake.DefaultRegion, iamapi, instanceProfileCache)
 	ssmProvider := ssmp.NewDefaultProvider(ssmapi, ssmCache)
-	amiProvider := amifamily.NewDefaultProvider(clock, versionProvider, ssmProvider, ec2api, ec2Cache)
+	amiProvider := amifamily.NewDefaultProvider(fakeClock, versionProvider, ssmProvider, ec2api, ec2Cache)
 	amiResolver := amifamily.NewDefaultResolver()
 	instanceTypesResolver := instancetype.NewDefaultResolver(fake.DefaultRegion, pricingProvider, unavailableOfferingsCache)
 	instanceTypesProvider := instancetype.NewDefaultProvider(instanceTypeCache, ec2api, subnetProvider, instanceTypesResolver)
@@ -127,6 +129,7 @@ func NewEnvironment(ctx context.Context, env *coretest.Environment) *Environment
 			launchTemplateCache,
 			ec2api,
 			eksapi,
+			kmsapi,
 			amiResolver,
 			securityGroupProvider,
 			subnetProvider,
@@ -145,12 +148,13 @@ func NewEnvironment(ctx context.Context, env *coretest.Environment) *Environment
 		)
 
 	return &Environment{
-		Clock: clock,
+		Clock: fakeClock,
 
 		EC2API:     ec2api,
 		EKSAPI:     eksapi,
 		SSMAPI:     ssmapi,
 		IAMAPI:     iamapi,
+		KMSAPI:     kmsapi,
 		PricingAPI: fakePricingAPI,
 
 		EC2Cache:                      ec2Cache,
@@ -185,6 +189,7 @@ func (env *Environment) Reset() {
 	env.EKSAPI.Reset()
 	env.SSMAPI.Reset()
 	env.IAMAPI.Reset()
+	env.KMSAPI.Reset()
 	env.PricingAPI.Reset()
 	env.PricingProvider.Reset()
 	env.InstanceTypesProvider.Reset()
